@@ -674,7 +674,11 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.counters["stat_rows_written"] += len(stats)
                 self.last_written[sid] = f"{len(stats)} rows {first_hour.isoformat()}..{last_hour.isoformat()}"
                 written[sid] = (len(stats), planned[sid][-1][2] if planned[sid] else 0)
-            await get_instance(self.hass).async_block_till_done()
+            # The recorder does not commit until Home Assistant has started; waiting here
+            # during setup would deadlock startup. Readers that need the rows
+            # (_verify_backfill) poll for them instead.
+            if self.hass.state is CoreState.running:
+                await get_instance(self.hass).async_block_till_done()
         _LOGGER.debug("Wrote SmartHub statistics %s from %s to %s", sorted(ids.values()), first_hour, last_hour)
         return written
 
@@ -864,7 +868,8 @@ class SmartHubDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         deadline = asyncio.get_running_loop().time() + VERIFY_TIMEOUT
         while True:
-            await get_instance(self.hass).async_block_till_done()
+            if self.hass.state is CoreState.running:
+                await get_instance(self.hass).async_block_till_done()
             rows = await self._rows(set(written), P.floor_hour(origin), None)
             problems = []
             for sid, (count, final_sum) in written.items():

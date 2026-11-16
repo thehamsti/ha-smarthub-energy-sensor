@@ -331,3 +331,22 @@ async def test_throttled_login_blocks_traffic_and_schedule(env):
     coord.api = real
     coord._reschedule(datetime.fromisoformat(NOW))
     assert datetime.fromisoformat(NOW) + coord.schedule.wait >= real.not_before
+
+
+async def test_refresh_during_startup_does_not_wait_for_recorder_commit(env, monkeypatch):
+    """The recorder commits only after Home Assistant has started: setup must not wait on it."""
+    import asyncio
+
+    from homeassistant.core import CoreState
+
+    hass, coord, api, _ = env
+    await backfilled(env)  # statistics exist, so the next full update writes rows
+    never = asyncio.get_running_loop().create_future()
+    monkeypatch.setattr(get_instance(hass), "async_block_till_done", lambda: never)
+    hass.set_state(CoreState.starting)
+    try:
+        force_full(coord)
+        data = await asyncio.wait_for(coord._async_update_data(), 30)
+    finally:
+        hass.set_state(CoreState.running)
+    assert not data[LOCATION.id]["stale"] and coord.counters["stat_rows_written"] > 0
