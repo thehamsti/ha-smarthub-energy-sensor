@@ -9,12 +9,14 @@
           "account_id": "Account ID",
           "host": "SmartHub Host",
           "timezone": "Timezone for power company",
-          "mfa_totp": "MFA TOTP Seed"
+          "mfa_totp": "MFA TOTP Seed",
+          "poll_interval": "Poll interval (minutes, optional)"
         },
-        "data_description" : {
+        "data_description": {
           "host": "e.g XXXXXX.smarthub.coop",
-          "timezone": "Timezone for power company",
-          "mfa_totp": "MFA TOTP Seed - only required if using MFA"
+          "timezone": "Time zone of the power company (defaults to Home Assistant's time zone)",
+          "mfa_totp": "MFA TOTP Seed - only required if using MFA",
+          "poll_interval": "Leave empty to poll adaptively around when the utility publishes data (recommended)."
         }
       }
     },

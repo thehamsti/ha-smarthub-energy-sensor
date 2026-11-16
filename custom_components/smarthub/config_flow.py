@@ -77,7 +77,8 @@ class SmartHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                vol.Required(CONF_PASSWORD): str,
                vol.Required(CONF_ACCOUNT_ID): str,
                vol.Required(CONF_HOST): str,
-               vol.Required(CONF_TIMEZONE, default="GMT"): SelectSelector(
+               # SmartHub reports local wall-clock times; the utility serves this location.
+               vol.Required(CONF_TIMEZONE, default=self.hass.config.time_zone or "GMT"): SelectSelector(
                 SelectSelectorConfig(
                   options=list(timezones), mode=SelectSelectorMode.DROPDOWN, sort=True
                 )
@@ -87,7 +88,9 @@ class SmartHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                    type=TextSelectorType.PASSWORD
                  )
                ),
-               vol.Required(CONF_POLL_INTERVAL, default=DEFAULT_POLL_INTERVAL): vol.All(vol.Coerce(int), vol.Range(min=MIN_POLL_INTERVAL, max=MAX_POLL_INTERVAL)),
+               # Empty = adaptive polling around the utility's publish time (recommended);
+               # a value forces a fixed interval in minutes.
+               vol.Optional(CONF_POLL_INTERVAL): vol.All(vol.Coerce(int), vol.Range(min=MIN_POLL_INTERVAL, max=MAX_POLL_INTERVAL)),
             }
         )
 
