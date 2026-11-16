@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import random
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional, List
@@ -32,12 +34,40 @@ from .utils import sanitize_host, parse_epoch_set_timezone
 
 _LOGGER = logging.getLogger(__name__)
 
+# Payloads above this size are decoded in an executor thread (a 31-day 15-minute
+# HOURLY response is ~2.5 MB).
+_JSON_EXECUTOR_THRESHOLD = 256 * 1024
+_RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+PENDING_POLLS = 6
+PENDING_DELAY = 3  # seconds
+MAX_INLINE_RETRY_AFTER = 60  # seconds; longer server-requested waits end the call
+
+
+def _retry_after_seconds(value: Optional[str]) -> Optional[float]:
+    """Parse Retry-After (delta-seconds or HTTP-date)."""
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return float(value)
+    try:
+        from email.utils import parsedate_to_datetime
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
 class ParseType(StrEnum):
     FORWARD = "FORWARD"
+    TOTAL = "TOTAL"      # upstream #71: some co-ops label consumption TOTAL
     NET = "NET"
     RETURN = "RETURN"
-    REVERSE = "REVERSE"
-    TOTAL = "TOTAL"
+    REVERSE = "REVERSE"  # upstream #73: export/generation channel (values are <= 0)
 
 class Aggregation(StrEnum):
     HOURLY = "HOURLY"
@@ -121,6 +151,8 @@ class SmartHubAPI:
         self.primary_username: Optional[str] = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_created_at: Optional[datetime] = None
+        # Server-requested quiet period (Retry-After); no request of any kind before it.
+        self.not_before: Optional[datetime] = None
 
     def parse_usage_series(self, usage_data: List[Dict], parseType: ParseType = ParseType.FORWARD) -> List[Dict]:
         parsed_data = []
@@ -158,11 +190,10 @@ class SmartHubAPI:
                 usage_energy = 0
               else:
                 usage_energy = abs(usage_energy)
-            elif parseType == ParseType.RETURN:
-              # SECO (and likely other utilities) report the REVERSE/RETURN meter's
-              # generation series as negative deltas, not positive - take the magnitude.
+            elif parseType in (ParseType.RETURN, ParseType.REVERSE):
+              # Export channels may be reported as negative (REVERSE "Generation").
               usage_energy = abs(usage_energy)
-            else: # FORWARD uses positive values only
+            else:
               usage_energy = max(0,usage_energy)
 
 
@@ -214,10 +245,10 @@ class SmartHubAPI:
                     net_series = ""
                     return_series = ""
                     if len(meters) > 2:
-                      _LOGGER.warning("More then 2 meters in usage data: %s", meters)
+                      _LOGGER.debug("%d meter channels in usage data", len(meters))
                     for meter in meters:
                       # assume forward is default if not present
-                      flow_direction = meter.get("flowDirection", ParseType.FORWARD)
+                      flow_direction = str(meter.get("flowDirection", ParseType.FORWARD)).upper()
                       match flow_direction:
                         case ParseType.FORWARD | ParseType.TOTAL:
                           forward_series = meter["seriesId"]
@@ -226,7 +257,7 @@ class SmartHubAPI:
                         case ParseType.RETURN | ParseType.REVERSE:
                           return_series = meter["seriesId"]
                         case _:
-                          _LOGGER.warning("Unknown flow direction in meter: %s", meter)
+                          _LOGGER.debug("Ignoring meter channel with flow direction %s", flow_direction)
 
                     series = entry.get("series", [])
                     for serie in series:
@@ -254,7 +285,7 @@ class SmartHubAPI:
             return parsed_response
 
         except Exception as e:
-            _LOGGER.error("Error parsing usage data: %s", data)
+            _LOGGER.debug("Error parsing usage data", exc_info=True)
             raise SmartHubDataError(f"Error parsing usage data: {e}") from e
 
     def parse_locations(self, location_json) -> List[SmartHubLocation]:
@@ -424,6 +455,7 @@ class SmartHubAPI:
           payload["twoFactorCode"] = current_otp
 
         _LOGGER.debug("Sending authentication request to: %s", auth_url)
+        self._check_not_before("authentication")
 
         try:
             session = await self._get_session()
@@ -434,46 +466,42 @@ class SmartHubAPI:
                 if response.status == 401:
                     raise SmartHubAuthenticationError("Invalid credentials")
                 elif response.status != 200:
+                    requested = _retry_after_seconds(response.headers.get("Retry-After"))
+                    if response.status in _RETRYABLE_STATUS and requested is not None:
+                        # Throttled at login: no traffic of any kind until the server's deadline.
+                        self.not_before = datetime.now(timezone.utc) + timedelta(seconds=requested)
                     raise SmartHubConnectionError(
                         f"Authentication failed with HTTP status: {response.status}"
+                        + (f", retry after {requested:.0f}s" if requested is not None else "")
                     )
 
                 try:
-                    response_json = await response.json()
+                    response_json = await response.json(content_type=None)
                 except Exception as e:
-                    raise SmartHubDataError(f"Invalid JSON response: {e}") from e
+                    raise SmartHubConnectionError(f"Invalid authentication response: {type(e).__name__}") from e
+                if not isinstance(response_json, dict):
+                    raise SmartHubConnectionError("Invalid authentication response")
 
                 self.token = response_json.get("authorizationToken")
                 self.primary_username = response_json.get("primaryUsername", self.email)
 
                 if not self.token:
-                    raise SmartHubAuthenticationError("No authorization token in response")
+                    # 200 without a token is an unexpected response (maintenance page etc.),
+                    # not proof of bad credentials; treat it as transient.
+                    raise SmartHubConnectionError("No authorization token in authentication response")
 
                 _LOGGER.debug("Successfully retrieved authentication token")
                 return self.token
 
-        except ClientError as e:
-            raise SmartHubConnectionError(f"Connection error during authentication: {e}") from e
+        except (ClientError, asyncio.TimeoutError) as e:
+            raise SmartHubConnectionError(f"Connection error during authentication: {type(e).__name__}: {e}") from e
 
-    async def get_service_locations(self) -> List[SmartHubLocation]:
-        """
-        Retrieve details about the service locaitons
+    def _check_not_before(self, what: str) -> None:
+        if self.not_before is not None and datetime.now(timezone.utc) < self.not_before:
+            raise SmartHubConnectionError(f"{what}: utility asked to wait until {self.not_before.isoformat()}")
 
-        Returns:
-            List of SmartHubLocation
-
-        Raises:
-            SmartHubAPIError: If the request fails after retries.
-        """
-        user_data_url = f"https://{self.host}/services/secured/user-data"
-        payload = {
-          "userId" : self.primary_username,
-        }
-
-        if not self.token:
-            await self._refresh_authentication()
-
-        headers = {
+    def _headers(self) -> Dict[str, str]:
+        return {
             "Authority": self.host,
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
@@ -481,53 +509,102 @@ class SmartHubAPI:
             "User-Agent": "HomeAssistant SmartHub Integration",
         }
 
+    async def _decode_json(self, response: aiohttp.ClientResponse) -> Any:
+        """Decode a JSON body, off the event loop for large payloads."""
+        body = await response.read()
         try:
-            session = await self._get_session()
-            async with session.get(user_data_url, headers=headers, params=payload) as response:
-                _ = await response.text()
-                _LOGGER.debug("User Data response status: %s", response.status)
+            if len(body) > _JSON_EXECUTOR_THRESHOLD:
+                return await asyncio.get_running_loop().run_in_executor(None, json.loads, body)
+            return json.loads(body)
+        except ValueError as e:
+            raise SmartHubDataError(f"Invalid JSON response ({len(body)} bytes)") from e
 
-                if response.status == 401:
-                    raise SmartHubAuthenticationError("Invalid credentials")
-                elif response.status != 200:
-                    raise SmartHubConnectionError(
-                        f"User_data request failed with HTTP status: {response.status}"
-                    )
+    async def _authorized_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        json_body: Optional[Dict[str, Any]] = None,
+        what: str = "request",
+    ) -> Any:
+        """Send an authorized request and return decoded JSON.
 
-                try:
-                    response_json = await response.json()
-                except Exception as e:
-                    raise SmartHubDataError(f"Invalid JSON response: {e}") from e
-
-                return self.parse_locations(response_json)
-
-        except ClientError as e:
-            raise SmartHubConnectionError(f"Connection error during User_data request: {e}") from e
-
-    async def get_energy_data(self, location, aggregation:Aggregation, start_datetime=None) -> Optional[Dict[str, Any]]:
+        - reuses the bearer token; on 401 re-authenticates once and retries
+        - retries timeouts, connection errors, 408/425/429/5xx with jittered backoff
         """
-        Retrieve energy usage data asynchronously with retry logic.
+        reauthed = False
+        last_error: Optional[Exception] = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            self._check_not_before(what)
+            if not self.token:
+                await self._refresh_authentication()
+                reauthed = True
+            try:
+                session = await self._get_session()
+                async with session.request(
+                    method, url, headers=self._headers(), params=params, json=json_body
+                ) as response:
+                    if response.status == 401:
+                        if reauthed:
+                            raise SmartHubAuthenticationError(f"{what}: unauthorized after re-authentication")
+                        _LOGGER.debug("%s: token rejected, re-authenticating", what)
+                        self.token = None
+                        reauthed = True
+                        continue
+                    if response.status in _RETRYABLE_STATUS:
+                        last_error = SmartHubConnectionError(f"{what}: HTTP {response.status}")
+                        requested = _retry_after_seconds(response.headers.get("Retry-After"))
+                        if requested is not None and requested > MAX_INLINE_RETRY_AFTER:
+                            # Honor the server: no traffic of any kind until the deadline.
+                            self.not_before = datetime.now(timezone.utc) + timedelta(seconds=requested)
+                            raise SmartHubConnectionError(
+                                f"{what}: HTTP {response.status}, server asked to retry after {requested:.0f}s"
+                            )
+                        if requested is not None:
+                            await asyncio.sleep(requested + random.random())
+                            continue
+                        delay = RETRY_DELAY * (2 ** (attempt - 1))
+                    elif response.status != 200:
+                        raise SmartHubConnectionError(f"{what}: HTTP {response.status}")
+                    else:
+                        return await self._decode_json(response)
+            except (asyncio.TimeoutError, ClientError) as e:
+                last_error = SmartHubConnectionError(f"{what}: {type(e).__name__}: {e}")
+                delay = RETRY_DELAY * (2 ** (attempt - 1))
+            if attempt < MAX_RETRIES:
+                delay = min(delay, 60) * (1 + random.random() / 2)
+                _LOGGER.debug("%s failed (%s); retry %d in %.1fs", what, last_error, attempt, delay)
+                await asyncio.sleep(delay)
+        raise last_error or SmartHubConnectionError(f"{what}: failed after {MAX_RETRIES} attempts")
 
-        Returns:
-            Parsed energy usage data or None if no data available.
+    async def get_service_locations(self) -> List[SmartHubLocation]:
+        """Retrieve the account's active electric service locations."""
+        user_data_url = f"https://{self.host}/services/secured/user-data"
+        if not self.token:
+            await self._refresh_authentication()
+        response_json = await self._authorized_request(
+            "GET", user_data_url, params={"userId": self.primary_username}, what="user-data"
+        )
+        try:
+            return self.parse_locations(response_json)
+        except Exception as e:  # malformed structure
+            raise SmartHubDataError(f"Invalid user-data response: {type(e).__name__}") from e
 
-        Raises:
-            SmartHubAPIError: If the request fails after retries.
+    async def fetch_usage(
+        self,
+        location: SmartHubLocation,
+        aggregation: "Aggregation",
+        start: datetime,
+        end: datetime,
+    ) -> Dict[str, Any]:
+        """Return the raw COMPLETE usage-poll payload for [start, end] (aware datetimes).
+
+        Raises SmartHubDataError if the utility keeps answering PENDING or returns
+        an unexpected status; connection/auth errors propagate.
         """
         poll_url = f"https://{self.host}/services/secured/utility-usage/poll"
-
-        # Calculate startDateTime and endDateTime
-        now = datetime.now()
-        # Get data since specified start (or last 30 days) as of midnight yesterday
-        end_datetime = now.replace(minute=0, second=0, microsecond=0)
-        if start_datetime is None:
-          # fetch data from last period
-          start_datetime = end_datetime - timedelta(days=30)
-
-        start_timestamp = int(start_datetime.timestamp()) * 1000
-        end_timestamp = int(end_datetime.timestamp()) * 1000
-
-        data = {
+        body = {
             "timeFrame": aggregation.value,
             "userId": self.email,
             "screen": "USAGE_EXPLORER",
@@ -535,89 +612,26 @@ class SmartHubAPI:
             "serviceLocationNumber": location.id,
             "accountNumber": self.account_id,
             "industries": ["ELECTRIC"],
-            "startDateTime": str(start_timestamp),
-            "endDateTime": str(end_timestamp),
+            "startDateTime": str(int(start.timestamp()) * 1000),
+            "endDateTime": str(int(end.timestamp()) * 1000),
         }
+        for poll in range(1, PENDING_POLLS + 1):
+            payload = await self._authorized_request("POST", poll_url, json_body=body, what="usage-poll")
+            status = payload.get("status") if isinstance(payload, dict) else None
+            if status == "COMPLETE":
+                return payload
+            if status != "PENDING":
+                raise SmartHubDataError(f"usage-poll: unexpected status {status!r}")
+            if poll < PENDING_POLLS:
+                await asyncio.sleep(PENDING_DELAY)
+        raise SmartHubDataError(f"usage-poll: still PENDING after {PENDING_POLLS} polls")
 
-        _LOGGER.debug("Requesting energy data from: %s", poll_url)
-
-        # Track if we've already tried refreshing the token
-        token_refreshed = False
-
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                # If token is unset - refresh auth
-                if not self.token:
-                    await self._refresh_authentication()
-                    token_refreshed = True
-
-                headers = {
-                    "Authority": self.host,
-                    "Authorization": f"Bearer {self.token}",
-                    "Content-Type": "application/json",
-                    "X-Nisc-Smarthub-Username": self.email,
-                    "User-Agent": "HomeAssistant SmartHub Integration",
-                }
-
-                session = await self._get_session()
-                async with session.post(poll_url, headers=headers, json=data) as response:
-                    _LOGGER.debug("Attempt %d: Response status: %s", attempt, response.status)
-
-                    if response.status == 401:
-                        if not token_refreshed:
-                            # Token expired, refresh and retry
-                            _LOGGER.info("Token expired, refreshing authentication...")
-                            await self._refresh_authentication()
-                            token_refreshed = True
-                            continue
-                        else:
-                            # Already tried refreshing, this is a persistent auth issue
-                            raise SmartHubAuthenticationError("Authentication failed after token refresh")
-                    elif response.status != 200:
-                        error_text = await response.text()
-                        _LOGGER.warning("HTTP error %d: %s", response.status, error_text)
-                        raise SmartHubConnectionError(
-                            f"HTTP error {response.status}: {error_text}"
-                        )
-
-                    try:
-                        response_json = await response.json()
-                        # _LOGGER.debug(response_json) # Specific parts of usage are logged separately - uncomment for full response
-                    except Exception as e:
-                        raise SmartHubDataError(f"Invalid JSON response: {e}") from e
-
-                    # Check if the status is still pending
-                    status = response_json.get("status")
-                    if status == "PENDING":
-                        _LOGGER.debug("Attempt %d: Status is PENDING, retrying...", attempt)
-                        if attempt < MAX_RETRIES:
-                            await asyncio.sleep(RETRY_DELAY)
-                            continue
-                        else:
-                            _LOGGER.warning("Maximum retries reached, data still PENDING")
-                            return None
-                    elif status == "COMPLETE":
-                        _LOGGER.debug("Successfully retrieved energy data")
-                        return self.parse_usage(response_json)
-                    else:
-                        _LOGGER.warning("Unexpected status in response: %s", status)
-                        return None
-
-            except SmartHubAuthenticationError:
-                # Re-raise auth errors immediately
-                raise
-            except ClientError as e:
-                if attempt < MAX_RETRIES:
-                    _LOGGER.warning(
-                        "Attempt %d failed with connection error: %s, retrying...",
-                        attempt, e
-                    )
-                    await asyncio.sleep(RETRY_DELAY)
-                    continue
-                else:
-                    raise SmartHubConnectionError(
-                        f"Connection failed after {MAX_RETRIES} attempts: {e}"
-                    ) from e
-
-        raise SmartHubAPIError(f"Failed to retrieve data after {MAX_RETRIES} attempts")
-
+    async def get_energy_data(self, location, aggregation:Aggregation, start_datetime=None) -> Optional[Dict[str, Any]]:
+        """Legacy helper: fetch and parse usage with the v2.2.0 parser."""
+        end_datetime = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        if start_datetime is None:
+            start_datetime = end_datetime - timedelta(days=30)
+        if start_datetime.tzinfo is None:
+            start_datetime = start_datetime.astimezone()
+        payload = await self.fetch_usage(location, aggregation, start_datetime, end_datetime)
+        return self.parse_usage(payload)

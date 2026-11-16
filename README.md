@@ -6,6 +6,26 @@
 
 A Home Assistant custom integration that connects to SmartHub Coop energy portals to download the hourly or daily usage information. The integration populates historical electricity usage data, but does not show realtime data as that information is not available in SmartHub Coop energy portals. This integration is fully compatible with Home Assistant's Energy Dashboard, Net Mettering and provides reliable, stable monitoring for your energy consumption.
 
+> **About this fork.** This is a fork of [gagata/ha-smarthub-energy-sensor](https://github.com/gagata/ha-smarthub-energy-sensor)
+> (MIT, all credit to the original authors). It keeps the `smarthub` domain, so it installs over an existing setup
+> without changing the config entry, entities or unique IDs. Differences from upstream:
+>
+> - Interval timestamps are interpreted in the utility's time zone (Home Assistant's time zone when the entry has none),
+>   so hourly statistics line up with real local time.
+> - Grid import and export come from the meter's FORWARD/REVERSE registers when available (the NET series can drop
+>   readings); net is import − export. Statistics: `smarthub:grid_import|grid_export|grid_net_<account>_<location>_<meter>`,
+>   with a one-time verified backfill that follows the existing statistics' history.
+> - Additional meters at the same service location are tracked too (statistics `smarthub:meter_forward|meter_reverse_…`
+>   plus month-to-date sensors); an `excluded_meters` list in the entry data or options skips some (no UI yet). They are **not** added to the
+>   Energy dashboard automatically: check what a meter measures (load, production, …) before using it there.
+> - Month-to-date sensors (net, import, export, last reading), DST- and month-boundary-safe; late or revised readings
+>   are re-derived for the current month plus 7 days; missing or conflicting intervals are never written as energy.
+> - Adaptive polling learns when the utility publishes (usually once a day) and checks every 15 minutes around that
+>   time instead of every 6 hours; errors keep the last good value with backoff and honor `Retry-After`.
+> - Diagnostics download with credentials redacted.
+>
+> Install with HACS → *Custom repositories* → this repository (category *Integration*).
+
 ## ✨ Features
 
 - 🔌 **Energy Dashboard Integration**: Seamlessly works with Home Assistant's built-in Energy Dashboard, including backfilling hourly metrics

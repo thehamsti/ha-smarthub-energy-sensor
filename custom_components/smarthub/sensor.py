@@ -1,10 +1,9 @@
 """SmartHub energy sensor platform."""
 from __future__ import annotations
 
+from datetime import datetime
 import logging
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
-from typing import Any, Dict, Optional
+from typing import Any
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -15,51 +14,23 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfEnergy
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import (
-    CoordinatorEntity,
-    DataUpdateCoordinator,
-    UpdateFailed,
-)
-from homeassistant.util.unit_conversion import EnergyConverter
-from homeassistant.components.recorder.statistics import (
-    async_add_external_statistics,
-    get_last_statistics,
-    statistics_during_period,
-)
-from homeassistant.components.recorder import get_instance
-from homeassistant.components.recorder.models import (
-    StatisticData,
-    StatisticMetaData,
-)
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import slugify
 
-try:
-    from homeassistant.components.recorder.models import StatisticMeanType
-except ImportError:
-    from enum import Enum
-    class StatisticMeanType(str, Enum):
-        NONE = "none"
-        MEAN = "mean"
-        MAX = "max"
-        MIN = "min"
-
-
-from .api import Aggregation, SmartHubAPI, SmartHubLocation
-from .exceptions import (
-    SmartHubAuthenticationError,
-    SmartHubError as SmartHubAPIError,
-)
+from .api import SmartHubLocation
 from .const import (
-    DOMAIN,
-    ENERGY_SENSOR_KEY,
-    ATTR_LAST_READING_TIME,
     ATTR_ACCOUNT_ID,
+    ATTR_LAST_READING_TIME,
     ATTR_LOCATION_ID,
-    LOCATION_KEY,
-    HISTORICAL_IMPORT_DAYS,
+    DOMAIN,
     METER_NAME,
 )
+from .coordinator import SmartHubDataUpdateCoordinator, statistic_id
 
 _LOGGER = logging.getLogger(__name__)
+
+# Kept for backwards compatibility with code importing it from here.
+__all__ = ["SmartHubDataUpdateCoordinator"]
 
 
 async def async_setup_entry(
@@ -68,388 +39,225 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the SmartHub sensor platform."""
-    _LOGGER.debug("Setting up SmartHub sensor platform")
-
-    config: Dict[str, Any] = config_entry.data
-
-    coordinator = config_entry.runtime_data
-
-    # Ensure that it is the smartHub coordinator
-    assert type(coordinator) is SmartHubDataUpdateCoordinator
-
-    last_locations_consumption = coordinator.data.values()
-
-    # Create sensor entities for each location
-    entities = []
-    for last_consumption in last_locations_consumption:
-      entities.append(
-          SmartHubEnergySensor(
-              coordinator=coordinator,
-              config_entry=config_entry,
-              config=config,
-              location=last_consumption.get(LOCATION_KEY),
-          )
-      )
-
+    coordinator: SmartHubDataUpdateCoordinator = config_entry.runtime_data
+    config = config_entry.data
+    entities: list[SensorEntity] = []
+    for key, entry in (coordinator.data or {}).items():
+        location: SmartHubLocation = entry["location"]
+        if not entry.get("primary", True):
+            entities.extend(_meter_entities(coordinator, config_entry, config, location, key, entry))
+            continue
+        entities.append(SmartHubEnergySensor(coordinator, config_entry, config, location))
+        entities.append(SmartHubMonthToDateSensor(coordinator, config_entry, config, location, "import_mtd"))
+        if entry.get("export_mtd") is not None:
+            entities.append(SmartHubMonthToDateSensor(coordinator, config_entry, config, location, "export_mtd"))
+        entities.append(SmartHubLastReadingSensor(coordinator, config_entry, config, location))
     async_add_entities(entities)
-    _LOGGER.debug(f"{len(entities)} SmartHub sensor entities added successfully")
+    _LOGGER.debug("%d SmartHub sensor entities added", len(entities))
 
 
-class SmartHubDataUpdateCoordinator(DataUpdateCoordinator):
-    """Class to manage fetching SmartHub data."""
-
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        api: SmartHubAPI,
-        update_interval: timedelta,
-        config_entry: str,
-    ) -> None:
-        """Initialize the coordinator."""
-        super().__init__(
-            hass,
-            _LOGGER,
-            name=f"{DOMAIN}_{config_entry.entry_id}",
-            update_interval=update_interval,
-        )
-        self.api = api
-        self.account_id = config_entry.data.get('account_id','unknown')
-
-    async def _async_update_data(self) -> Dict[str, Any]:
-        """Fetch data from the SmartHub API."""
-        try:
-            _LOGGER.debug("Fetching data from SmartHub API")
-
-            # force a logout of the session
-            self.api.token = None
-
-            locations = await self.api.get_service_locations()
-
-            entity_response = {}
-
-            for location in locations:
-              # Because SmartHub provides historical usage/cost with delay of a
-              # number of hours we need to insert data into statistics.
-              await self._insert_statistics(location, Aggregation.HOURLY)
-              await self._insert_statistics(location, Aggregation.DAILY)
-
-              # Fetch monthly information for entity value
-              first_day_of_current_month = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
-              data = await self.api.get_energy_data(location=location, start_datetime=first_day_of_current_month, aggregation=Aggregation.MONTHLY)
-
-              if data.get("USAGE", None) is None or len(data.get("USAGE", None)) == 0:
-                  _LOGGER.warning("No data received from SmartHub API for location %s", location)
-                  # Return previous data if available, otherwise empty dict
-                  entity_response[location.id] = {
-                    ENERGY_SENSOR_KEY: 0, # no data - no energy usage for the entity.
-                    ATTR_LAST_READING_TIME: first_day_of_current_month.replace(tzinfo=ZoneInfo(self.api.timezone)), # use the TZ from the entity so it has consistent formating like 2026-02-01T00:00:00-05:00
-                    LOCATION_KEY: location,
-                    METER_NAME: data.get(METER_NAME, None)
-                  }
-                  continue
-
-              last_reading = data.get("USAGE")[-1]
-              _LOGGER.debug("Successfully fetched data: %s for location: %s", last_reading, location)
-
-              entity_response[location.id] = {
-                ENERGY_SENSOR_KEY: last_reading['consumption'],
-                ATTR_LAST_READING_TIME: last_reading['reading_time'],
-                LOCATION_KEY: location,
-                METER_NAME: data.get(METER_NAME, None)
-              }
-
-            return entity_response
-
-        except SmartHubAuthenticationError as e:
-            _LOGGER.error("Authentication error fetching SmartHub data: %s", e)
-            # For auth errors, we want to raise UpdateFailed to trigger retry
-            # but also ensure the API will refresh authentication on next attempt
-            raise UpdateFailed(f"Authentication failed: {e}") from e
-        except SmartHubAPIError as e:
-            _LOGGER.error("Error fetching data from SmartHub API: %s", e)
-            raise UpdateFailed(f"Error communicating with SmartHub API: {e}") from e
-        except Exception as e:
-            _LOGGER.exception("Unexpected error fetching SmartHub data: %s", e)
-            raise UpdateFailed(f"Unexpected error: {e}") from e
+def _meter_entities(coordinator, config_entry, config, location, key, entry) -> list[SensorEntity]:
+    """Entities for an additional (non-grid) meter at the location."""
+    out: list[SensorEntity] = [SmartHubMeterMonthSensor(coordinator, config_entry, config, location, key, entry["meter"],
+                                                        "import_mtd")]
+    if entry.get("export_mtd") is not None:
+        out.append(SmartHubMeterMonthSensor(coordinator, config_entry, config, location, key, entry["meter"],
+                                            "export_mtd"))
+    out.append(SmartHubLastReadingSensor(coordinator, config_entry, config, location, key=key, meter=entry["meter"]))
+    return out
 
 
-    # https://github.com/tronikos/opower/ was used as a model for how to populate
-    # hourly metrics when access to realtime information is not possible via
-    # utility dashboards.
-    async def _insert_statistics(self, location, aggregation: Aggregation):
-        """Retrieve energy usage data asynchronously with retry logic. Always backfills the data overwriting the history based on the collection window."""
-        consumption_statistic_id = f"{DOMAIN}:smarthub_energy_sensor{aggregation.suffix}_{self.account_id}_{location.id}"
-        return_statistic_id = f"{DOMAIN}:smarthub_energy_return_sensor{aggregation.suffix}_{self.account_id}_{location.id}"
-
-        consumption_unit_class = (
-            EnergyConverter.UNIT_CLASS
-        )
-        consumption_unit = (
-            UnitOfEnergy.KILO_WATT_HOUR
-        )
-        consumption_metadata = StatisticMetaData(
-            mean_type=StatisticMeanType.NONE,
-            has_sum=True,
-            name=f"{location.provider} SmartHub Energy {aggregation.label} Usage - {self.account_id} - {location.description}",
-            source=DOMAIN,
-            statistic_id=consumption_statistic_id,
-            unit_class=consumption_unit_class, # required in 2025.11
-            unit_of_measurement=consumption_unit,
-        )
-
-        return_metadata = StatisticMetaData(
-            mean_type=StatisticMeanType.NONE,
-            has_sum=True,
-            name=f"{location.provider} SmartHub Energy {aggregation.label} Return - {self.account_id} - {location.description}",
-            source=DOMAIN,
-            statistic_id=return_statistic_id,
-            unit_class=consumption_unit_class, # required in 2025.11
-            unit_of_measurement=consumption_unit,
-        )
-
-        last_stat = await get_instance(self.hass).async_add_executor_job(
-            get_last_statistics, self.hass, 1, consumption_statistic_id, True, set()
-        )
-        _LOGGER.debug("last_stat for %s: %s", aggregation.label, last_stat)
-
-        smarthub_data = {}
-        if not last_stat:
-            _LOGGER.debug("Updating %s statistic for the first time", aggregation.label)
-            consumption_sum = 0.0
-            return_sum      = 0.0
-            last_stats_time = None
-
-            # Initialize with last HISTORICAL_IMPORT_DAYS (usually 90) days of data
-            start_datetime = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=HISTORICAL_IMPORT_DAYS)
-
-            # Load read data for use in populating statistics
-            smarthub_data = await self.api.get_energy_data(location=location, aggregation=aggregation, start_datetime=start_datetime)
-        else:
-            _LOGGER.debug("Checking if data migration is needed for %s...", aggregation.label)
-            migrated = False
-            # SmartHub doesn't hvae any current migrations - this sample code was left
-            # from the opower version
-            #migrated = await self._async_maybe_migrate_statistics(
-            #    account.utility_account_id,
-            #    {
-            #        cost_statistic_id: compensation_statistic_id,
-            #        consumption_statistic_id: return_statistic_id,
-            #    },
-            #    {
-            #        cost_statistic_id: cost_metadata,
-            #        compensation_statistic_id: compensation_metadata,
-            #        consumption_statistic_id: consumption_metadata,
-            #        return_metadata: return_metadata,
-            #    },
-            #)
-            if migrated:
-                # Skip update to avoid working on old data since the migration is done
-                # asynchronously. Update the statistics in the next refresh in 12h.
-                _LOGGER.debug(
-                    "Statistics migration completed. Skipping update for now"
-                )
-                return
-
-            # Update reads...
-            # Load read data for use in populating statistics
-            start_datetime = datetime.fromtimestamp(last_stat[consumption_statistic_id][0]["start"], tz=timezone.utc)
-
-            # always backdate the start_datetime to ensure no gaps in recorded data
-            start_datetime = start_datetime - timedelta(days=2)
-
-            _LOGGER.debug("Fetching %s statistics from %s", aggregation.label, start_datetime)
-            smarthub_data = await self.api.get_energy_data(location=location, start_datetime=start_datetime, aggregation=aggregation)
-
-            if not smarthub_data or not smarthub_data.get("USAGE"):
-              _LOGGER.warning("No data received from SmartHub API for location %s to populate historical %s stats", location, aggregation.label)
-              # No new data to record in statatistics
-              return
-
-            start = smarthub_data.get("USAGE")[0].get("reading_time")
-            _LOGGER.debug("Getting %s statistics at: %s", aggregation.label, start)
-
-            # In the common case there should be a previous statistic at start time
-            # so we only need to fetch one statistic. If there isn't any, fetch all.
-            # Counterintutitively - but consistent with opower - this aligns the
-            # last Stats collection with the data collected form the server - then imports
-            # and overrights all the data after that point. The opower logic is that the
-            # data might be refreshed, or have collection gaps that are fixed.
-            # Its duplicated for SmartHub as it seems reasonable.
-            for end in (start + timedelta(seconds=1), None):
-                stats = await get_instance(self.hass).async_add_executor_job(
-                    statistics_during_period,
-                    self.hass,
-                    start,
-                    end,
-                    {
-                        consumption_statistic_id,
-                        return_statistic_id,
-                    },
-                    aggregation.period,
-                    None,
-                    {"sum"},
-                )
-                if stats:
-                    break
-                if end:
-                    _LOGGER.debug(
-                        "Not found. Trying to find the oldest statistic after %s",
-                        start,
-                    )
-            # We are in this code path only if get_last_statistics found a stat
-            # so statistics_during_period should also have found at least one.
-            assert stats
-
-            def _safe_get_sum(records: list[Any]) -> float:
-                if records and "sum" in records[0]:
-                    return float(records[0]["sum"])
-                return 0.0
-
-            consumption_sum = _safe_get_sum(stats.get(consumption_statistic_id, []))
-            return_sum    = _safe_get_sum(stats.get(return_statistic_id, []))
-            last_stats_time = stats[consumption_statistic_id][0]["start"]
-
-            _LOGGER.info(f"Updating %s statistics since %s", aggregation.label, last_stats_time)
-
-        consumption_statistics = []
-        return_statistics      = []
-
-        for cost_read in smarthub_data.get("USAGE", []):
-            start = cost_read.get("reading_time")
-            if last_stats_time is not None and start.timestamp() <= last_stats_time:
-                continue
-
-            consumption_state = max(0, cost_read.get("consumption"))
-            consumption_sum += consumption_state
-
-            consumption_statistics.append(
-                StatisticData(
-                    start=start, state=consumption_state, sum=consumption_sum
-                )
-            )
-
-        for return_read in smarthub_data.get("USAGE_RETURN", []):
-            start = return_read.get("reading_time")
-            if last_stats_time is not None and start.timestamp() <= last_stats_time:
-                continue
-
-            return_state = max(0, return_read.get("consumption"))
-            return_sum += return_state
-
-            return_statistics.append(
-                StatisticData(
-                    start=start, state=return_state, sum=return_sum
-                )
-            )
-
-        # If the location description is blank, use the meter name instead.
-        if location.description == "":
-          consumption_metadata["name"]=f"{location.provider} SmartHub Energy {aggregation.label} Usage - {self.account_id} - {smarthub_data.get(METER_NAME, None)}"
-          return_metadata["name"]=f"{location.provider} SmartHub Energy {aggregation.label} Return - {self.account_id} - {smarthub_data.get(METER_NAME, None)}"
-
-        _LOGGER.info(
-            "Adding %s statistics for %s",
-            len(consumption_statistics),
-            consumption_statistic_id,
-        )
-        async_add_external_statistics(
-            self.hass, consumption_metadata, consumption_statistics
-        )
-
-        if "USAGE_RETURN" in smarthub_data:
-          _LOGGER.info(
-            "Adding %s return statistics for %s",
-            len(return_statistics),
-            return_statistic_id,
-          )
-          async_add_external_statistics(
-            self.hass, return_metadata, return_statistics
-          )
-
-
-class SmartHubEnergySensor(CoordinatorEntity, SensorEntity):
-    """Representation of a SmartHub energy sensor."""
-
-    _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_state_class = SensorStateClass.TOTAL_INCREASING
-    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
-    _attr_icon = "mdi:lightning-bolt"
+class _SmartHubBase(CoordinatorEntity[SmartHubDataUpdateCoordinator], SensorEntity):
+    """Common plumbing: device, availability (last good value) and attributes."""
 
     def __init__(
         self,
         coordinator: SmartHubDataUpdateCoordinator,
         config_entry: ConfigEntry,
-        config: Dict[str, Any],
+        config: dict[str, Any],
         location: SmartHubLocation,
     ) -> None:
-        """Initialize the sensor."""
         super().__init__(coordinator)
-
         self._config_entry = config_entry
         self._config = config
-        self._attr_unique_id = f"{config_entry.unique_id}_{location.id}_energy"
         self.location = location
+        self._account_id = str(config.get("account_id", "Unknown"))
+        self._data_key = location.id
 
-        # Extract account info for naming
-        account_id = config.get("account_id", "Unknown")
-
-        self._attr_name = f"{self.location.provider} SmartHub Energy Monthly Usage - {account_id} {self.location.description}"
-
-        _LOGGER.debug("Initialized SmartHub energy sensor with unique_id: %s", self._attr_unique_id)
+    @property
+    def _entry(self) -> dict[str, Any]:
+        return (self.coordinator.data or {}).get(self._data_key) or {}
 
     @property
     def available(self) -> bool:
-        """Return True if entity is available."""
-        return self.coordinator.last_update_success and self.native_value is not None
+        # Keep the last good value through transient failures; the coordinator only
+        # drops data if the integration is unloaded.
+        return self.native_value is not None
 
     @property
-    def native_value(self) -> Optional[float]:
-        """Return the state of the sensor."""
-        if not self.coordinator.data:
-            return None
-
-        value = self.coordinator.data.get(self.location.id, {}).get(ENERGY_SENSOR_KEY, None)
-        if value is None:
-            _LOGGER.debug("No energy usage value found in coordinator data")
-            return None
-
-        try:
-            return float(value)
-        except (ValueError, TypeError) as e:
-            _LOGGER.warning("Could not convert energy value '%s' to float: %s", value, e)
-            return None
-
-    @property
-    def extra_state_attributes(self) -> Dict[str, Any]:
-        """Return additional state attributes."""
-        attributes = {
-            ATTR_ACCOUNT_ID: self._config.get("account_id"),
-            ATTR_LOCATION_ID: self.location.id,
-        }
-
-        # Add last reading time & meter name if available
-        if self.coordinator.data:
-            last_reading = self.coordinator.data.get(self.location.id).get(ATTR_LAST_READING_TIME)
-            if last_reading:
-                attributes[ATTR_LAST_READING_TIME] = last_reading
-
-            meter_name = self.coordinator.data.get(self.location.id).get(METER_NAME)
-            if meter_name:
-                attributes[METER_NAME] = meter_name
-
-        return attributes
-
-    @property
-    def device_info(self) -> Dict[str, Any]:
-        """Return device information."""
-        account_id = self._config.get("account_id", "Unknown")
+    def device_info(self) -> dict[str, Any]:
         host = self._config.get("host", "Unknown")
-
         return {
             "identifiers": {(DOMAIN, self._config_entry.unique_id or self._config_entry.entry_id)},
-            "name": f"{self.location.provider} SmartHub Energy Monthly Usage ({account_id} - {self.location.description})",
+            "name": f"{self.location.provider} SmartHub Energy Monthly Usage ({self._account_id} - {self.location.description})",
             "manufacturer": "SmartHub Coop",
             "model": "Energy Monitor",
             "configuration_url": f"https://{host}",
         }
+
+    def _common_attributes(self) -> dict[str, Any]:
+        entry = self._entry
+        attrs: dict[str, Any] = {
+            ATTR_ACCOUNT_ID: self._config.get("account_id"),
+            ATTR_LOCATION_ID: self.location.id,
+        }
+        if entry.get("data_end"):
+            attrs[ATTR_LAST_READING_TIME] = entry["data_end"].astimezone(self.coordinator.tz)
+        if entry.get("meter"):
+            attrs[METER_NAME] = entry["meter"]
+        attrs["data_stale"] = bool(entry.get("stale"))
+        return attrs
+
+
+class SmartHubEnergySensor(_SmartHubBase):
+    """Month-to-date NET grid energy (import - export). Existing entity; unique_id unchanged."""
+
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_suggested_display_precision = 2
+    _attr_icon = "mdi:lightning-bolt"
+
+    def __init__(self, coordinator, config_entry, config, location) -> None:
+        super().__init__(coordinator, config_entry, config, location)
+        self._attr_unique_id = f"{config_entry.unique_id}_{location.id}_energy"
+        self._attr_name = (
+            f"{location.provider} SmartHub Energy Monthly Usage - {self._account_id} {location.description}"
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        return self._entry.get("net_mtd")
+
+    @property
+    def last_reset(self) -> datetime | None:
+        return self._entry.get("month_start")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        attrs = self._common_attributes()
+        entry = self._entry
+        attrs["import_mtd"] = entry.get("import_mtd")
+        if entry.get("export_mtd") is not None:
+            attrs["export_mtd"] = entry.get("export_mtd")
+        if entry.get("meter"):
+            attrs["statistic_ids"] = [
+                statistic_id(role, self._account_id, self.location.id, entry["meter"])
+                for role in ("import", "export", "net")
+            ]
+        return attrs
+
+
+class SmartHubMonthToDateSensor(_SmartHubBase):
+    """Month-to-date grid import or export."""
+
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_suggested_display_precision = 2
+
+    _KINDS = {
+        "import_mtd": ("Grid Import This Month", "grid_import_this_month", "mdi:transmission-tower-import"),
+        "export_mtd": ("Grid Export This Month", "grid_export_this_month", "mdi:transmission-tower-export"),
+    }
+
+    def __init__(self, coordinator, config_entry, config, location, kind: str) -> None:
+        super().__init__(coordinator, config_entry, config, location)
+        self._kind = kind
+        label, slug, icon = self._KINDS[kind]
+        meter = (coordinator.data or {}).get(location.id, {}).get("meter", "meter")
+        self._attr_unique_id = f"{config_entry.entry_id}_{location.id}_{meter}_{kind}"
+        self._attr_name = f"SmartHub {label} - {self._account_id} {location.description}"
+        self._attr_icon = icon
+        self.entity_id = f"sensor.smarthub_{slug}_{slugify(self._account_id)}_{slugify(location.description or location.id)}"
+
+    @property
+    def native_value(self) -> float | None:
+        return self._entry.get(self._kind)
+
+    @property
+    def last_reset(self) -> datetime | None:
+        return self._entry.get("month_start")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return self._common_attributes()
+
+
+class SmartHubLastReadingSensor(_SmartHubBase):
+    """End time of the newest interval the utility has published (freshness)."""
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:clock-check-outline"
+
+    def __init__(self, coordinator, config_entry, config, location, key: str | None = None,
+                 meter: str | None = None) -> None:
+        super().__init__(coordinator, config_entry, config, location)
+        if key is not None:
+            self._data_key = key
+        meter = meter or (coordinator.data or {}).get(location.id, {}).get("meter", "meter")
+        self._attr_unique_id = f"{config_entry.entry_id}_{location.id}_{meter}_last_reading"
+        if key is None:
+            self._attr_name = f"SmartHub Last Meter Reading - {self._account_id} {location.description}"
+            self.entity_id = (f"sensor.smarthub_last_reading_{slugify(self._account_id)}_"
+                              f"{slugify(location.description or location.id)}")
+        else:
+            self._attr_name = f"SmartHub Meter {meter} Last Reading - {self._account_id} {location.description}"
+            self.entity_id = f"sensor.smarthub_meter_{slugify(meter)}_last_reading"
+
+    @property
+    def native_value(self) -> datetime | None:
+        return self._entry.get("data_end")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        attrs = self._common_attributes()
+        attrs.pop(ATTR_LAST_READING_TIME, None)
+        return attrs
+
+
+class SmartHubMeterMonthSensor(_SmartHubBase):
+    """Month-to-date energy of an additional meter, by register direction."""
+
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_suggested_display_precision = 2
+    _attr_icon = "mdi:meter-electric"
+    _KINDS = {"import_mtd": ("Energy This Month", "energy_this_month", "forward_mtd"),
+              "export_mtd": ("Reverse Energy This Month", "reverse_energy_this_month", "reverse_mtd")}
+
+    def __init__(self, coordinator, config_entry, config, location, key: str, meter: str, kind: str) -> None:
+        super().__init__(coordinator, config_entry, config, location)
+        self._data_key = key
+        self._kind = kind
+        label, slug, uid = self._KINDS[kind]
+        self._attr_unique_id = f"{config_entry.entry_id}_{location.id}_{meter}_{uid}"
+        self._attr_name = f"SmartHub Meter {meter} {label} - {self._account_id} {location.description}"
+        self.entity_id = f"sensor.smarthub_meter_{slugify(meter)}_{slug}"
+
+    @property
+    def native_value(self) -> float | None:
+        return self._entry.get(self._kind)
+
+    @property
+    def last_reset(self) -> datetime | None:
+        return self._entry.get("month_start")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        attrs = self._common_attributes()
+        if self._entry.get("meter"):
+            attrs["statistic_id"] = self.coordinator._sid(
+                "import" if self._kind == "import_mtd" else "export", self.location.id, self._entry["meter"])
+        return attrs

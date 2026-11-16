@@ -230,36 +230,40 @@ async def test_async_setup_entry_success(mock_hass, mock_config_entry):
     """Test successful setup of config entry."""
     with patch("custom_components.smarthub.SmartHubAPI") as mock_api_class:
         mock_api = Mock()
-        mock_api.get_token = AsyncMock(return_value="test_token")
         mock_api.close = AsyncMock()
         mock_api_class.return_value = mock_api
 
         with patch("custom_components.smarthub.SmartHubDataUpdateCoordinator") as mock_coordinator_cls:
-             mock_coordinator = mock_coordinator_cls.return_value
-             mock_coordinator.async_config_entry_first_refresh = AsyncMock()
+            mock_coordinator = mock_coordinator_cls.return_value
+            mock_coordinator.async_load_store = AsyncMock()
+            mock_coordinator.async_config_entry_first_refresh = AsyncMock()
+            mock_hass.config_entries.async_forward_entry_setups = AsyncMock()
 
-             # Configure mock_hass to support await
-             mock_hass.config_entries.async_forward_entry_setups = AsyncMock()
+            result = await async_setup_entry(mock_hass, mock_config_entry)
 
-             result = await async_setup_entry(mock_hass, mock_config_entry)
-
-             assert result is True
-             # In the new code, runtime_data is set on entry
-             assert hasattr(mock_config_entry, "runtime_data")
+            assert result is True
+            assert mock_config_entry.runtime_data is mock_coordinator
+            mock_api.close.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_async_setup_entry_connection_failure(mock_hass, mock_config_entry):
-    """Test setup failure due to connection error."""
+    """A transient failure on the first refresh lets Home Assistant retry setup."""
+    from homeassistant.exceptions import ConfigEntryNotReady
+
     with patch("custom_components.smarthub.SmartHubAPI") as mock_api_class:
         mock_api = Mock()
-        mock_api.get_token = AsyncMock(side_effect=Exception("Connection failed"))
         mock_api.close = AsyncMock()
         mock_api_class.return_value = mock_api
-
-        from homeassistant.exceptions import ConfigEntryError
-        with pytest.raises(ConfigEntryError):
-            await async_setup_entry(mock_hass, mock_config_entry)
+        with patch("custom_components.smarthub.SmartHubDataUpdateCoordinator") as mock_coordinator_cls:
+            mock_coordinator = mock_coordinator_cls.return_value
+            mock_coordinator.async_load_store = AsyncMock()
+            mock_coordinator.async_config_entry_first_refresh = AsyncMock(
+                side_effect=ConfigEntryNotReady("Connection failed")
+            )
+            with pytest.raises(ConfigEntryNotReady):
+                await async_setup_entry(mock_hass, mock_config_entry)
+            mock_api.close.assert_awaited_once()
 
 
 def test_smarthub_api_basic_functionality():

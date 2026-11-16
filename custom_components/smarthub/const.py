@@ -1,4 +1,6 @@
 """Constants for the SmartHub integration."""
+from datetime import timedelta
+
 
 DOMAIN = "smarthub"
 
@@ -11,6 +13,8 @@ CONF_HOST = "host"
 CONF_POLL_INTERVAL = "poll_interval"
 CONF_TIMEZONE = "timezone"
 CONF_MFA_TOTP = "mfa_totp"
+CONF_METER_NUMBER = "meter_number"  # optional: pin the grid (primary) meter
+CONF_EXCLUDED_METERS = "excluded_meters"  # optional: meters at the location not to track
 
 # Default values
 DEFAULT_POLL_INTERVAL = 360  # 6 hour in minutes
@@ -36,3 +40,21 @@ METER_NAME   = "meter_name"
 ELECTRIC_SERVICE = "electric"
 SUPPORTED_SERVICES = [ELECTRIC_SERVICE]
 FALLBACK_SERVICES = ["ELEC", "1ELEC", "VELEC", "GELEC"]
+
+# Polling, statistics and backfill tuning
+STORAGE_VERSION = 1
+REWRITE_LOOKBACK = timedelta(days=7)      # hours re-derived on every full update (late/revised reads)
+PROBE_OVERLAP = timedelta(hours=2)        # probe window starts this far before the newest known interval
+LOCATIONS_TTL = timedelta(hours=24)       # cache of the account's service locations
+MAX_ARRIVALS = 14                         # remembered publish observations for adaptive polling
+BACKFILL_CHUNK_DAYS = 31                  # ~2.5 MB of 15-minute data per request
+BACKFILL_CHUNK_PAUSE = 2                  # seconds between backfill requests
+BACKFILL_MAX_DAYS = 800
+BACKFILL_RETRIES = 6
+BACKFILL_RETRY_DELAY = timedelta(minutes=20)
+MONTH_GRACE = timedelta(days=2)           # keep rewriting the previous month for 2 days into a new one
+RECONCILE_EVERY = timedelta(hours=24)     # full re-derive even when no newer interval was published
+FETCH_DEADLINE = timedelta(seconds=180)   # total budget per API call incl. retries/PENDING/re-auth
+GAP_CONFIRM = timedelta(minutes=10)      # a hole must persist this long (or across a re-fetch) to be accepted
+GAP_REFETCH_PAUSE = 10                    # seconds before re-fetching a backfill chunk that has holes
+VERIFY_TIMEOUT = 120                      # seconds to wait for the recorder to show a backfill

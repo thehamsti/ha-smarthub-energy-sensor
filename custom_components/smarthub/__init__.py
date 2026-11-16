@@ -12,15 +12,11 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryError
+from homeassistant.util import dt as dt_util
 
 from .api import SmartHubAPI
-from .sensor import  SmartHubDataUpdateCoordinator
-from .const import DOMAIN, DEFAULT_POLL_INTERVAL
-
-from datetime import timedelta
-
-# Remove explicit config flow import
-# from . import config_flow  # noqa: F401
+from .const import CONF_TIMEZONE, DOMAIN
+from .coordinator import SmartHubDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -31,76 +27,55 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up SmartHub from a config entry."""
     config = entry.data
 
-    # Validate required configuration
     required_fields = ["email", "password", "account_id", "host"]
     missing_fields = [field for field in required_fields if not config.get(field)]
-
     if missing_fields:
         _LOGGER.error("Missing required configuration fields: %s", missing_fields)
         raise ConfigEntryError(f"Missing configuration fields: {missing_fields}")
 
-    # Initialize the API object
+    # SmartHub reports interval timestamps in the utility's local wall-clock time.
+    # Entries created before the timezone option existed have no value; the
+    # utility serves this Home Assistant's location, so use HA's time zone rather
+    # than GMT (which shifted every statistic by the UTC offset).
+    tz_name = config.get(CONF_TIMEZONE) or hass.config.time_zone
+    tz = await dt_util.async_get_time_zone(tz_name)
+    if tz is None:
+        raise ConfigEntryError(f"Unknown time zone {tz_name!r}")
+
     api = SmartHubAPI(
         email=config["email"],
         password=config["password"],
         account_id=config["account_id"],
-        timezone=config.get("timezone", "GMT"), # timezone was not previously required - default it to be GMT
-        mfa_totp=config.get("mfa_totp", ""), # mfa_totp is optional
+        timezone=tz_name,
+        mfa_totp=config.get("mfa_totp", ""),
         host=config["host"],
     )
 
-    # Test the connection
+    coordinator = SmartHubDataUpdateCoordinator(hass, api, entry, tz)
     try:
-        await api.get_token()
-        _LOGGER.info("Successfully connected to SmartHub API")
-    except Exception as e:
-        _LOGGER.error("Failed to connect to SmartHub API: %s", e)
+        await coordinator.async_load_store()
+        # Raises ConfigEntryNotReady on transient failures (HA retries setup) and
+        # ConfigEntryError when the utility rejects the credentials.
+        await coordinator.async_config_entry_first_refresh()
+    except BaseException:
         await api.close()
-        raise ConfigEntryError(f"Cannot connect to SmartHub: {e}") from e
-
-    # Create update coordinator, and store in the config entry
-    coordinator = SmartHubDataUpdateCoordinator(
-        hass=hass,
-        api=api,
-        update_interval=timedelta(minutes=config.get("poll_interval", DEFAULT_POLL_INTERVAL)),
-        config_entry=entry,
-    )
-    await coordinator.async_config_entry_first_refresh()
+        raise
     entry.runtime_data = coordinator
 
-    # Set up platforms
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
+    try:
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except BaseException:
+        await coordinator.async_shutdown_api()
+        raise
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    # Unload platforms
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-
     if unload_ok:
-        # Clean up API connection
-        data = hass.data.get(DOMAIN,{}).get(entry.entry_id)
-
-        if hasattr(entry, "runtime_data") and hasattr(entry.runtime_data, "api"):
-            api= entry.runtime_data.api
-
-        if data:
-            if isinstance(data, dict) and "api" in data:
-                api = data["api"]
-            else:
-                api = data  # Direct API reference
-
-        if api:
-            await api.close()
-
-        # Remove data
-        hass.data.get(DOMAIN,{}).pop(entry.entry_id, None)
-
-        # Remove domain data if no entries left
-        if DOMAIN in hass.data:
-            hass.data.pop(DOMAIN, None)
-
+        coordinator = getattr(entry, "runtime_data", None)
+        if isinstance(coordinator, SmartHubDataUpdateCoordinator):
+            await coordinator.async_shutdown_api()
+        hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     return unload_ok
-
